@@ -1,0 +1,410 @@
+---
+title: "Final Exam Stock Comparison"
+author: "Ian Grace"
+date: "2025-12-03"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+## Part 1: Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)  
+library(lubridate)   
+library(zoo)         
+library(caret)      
+library(patchwork)   
+
+file1 <- "HistoricalData_1764620277051.csv"
+file3 <- "HistoricalData_1764620401341.csv"
+
+name1 <- "AAPL"
+name3 <- "AMZN"
+
+clean_stock <- function(path, stockname) {
+  df <- read.csv(path, stringsAsFactors = FALSE)
+
+  df %>%
+    mutate(
+      Date   = as.Date(Date, format = "%m/%d/%Y"),
+      Close  = as.numeric(gsub("[$,]", "", Close.Last)),
+      Open   = as.numeric(gsub("[$,]", "", Open)),
+      High   = as.numeric(gsub("[$,]", "", High)),
+      Low    = as.numeric(gsub("[$,]", "", Low)),
+      Volume = as.numeric(gsub(",", "", Volume)),
+      Stock  = stockname
+    ) %>%
+    select(Date, Stock, Open, High, Low, Close, Volume)
+}
+
+aapl <- clean_stock(file1, name1)
+amzn <- clean_stock(file3, name3)
+
+stocks_all <- bind_rows(aapl, amzn)
+
+glimpse(stocks_all)
+
+# Feature engineering
+
+stock_features <- stocks_all %>%
+  arrange(Stock, Date) %>%
+  group_by(Stock) %>%
+  mutate(
+    ReturnToday   = (Close - Open) / Open,
+    Range         = High - Low,
+
+    FiveDayMA     = rollmean(Close, k = 5, fill = NA, align = "right"),
+
+    Above5DayMA   = ifelse(Close > FiveDayMA, "Yes", "No"),
+
+    LaggedReturn  = lag(ReturnToday),
+
+    UpNextDay_num = ifelse(lead(Close) > Close, 1, 0),
+
+    DayOfWeek     = weekdays(Date)
+  ) %>%
+  ungroup()
+
+model_data <- stock_features %>%
+  filter(
+    !is.na(UpNextDay_num),
+    !is.na(ReturnToday),
+    !is.na(LaggedReturn),
+    !is.na(FiveDayMA)
+  ) %>%
+  mutate(
+    UpNextDay   = factor(ifelse(UpNextDay_num == 1, "Up", "Down")),
+    Stock       = factor(Stock),
+    DayOfWeek   = factor(DayOfWeek),
+    Above5DayMA = factor(Above5DayMA, levels = c("No", "Yes"))
+  ) %>%
+  select(
+    UpNextDay, Stock, DayOfWeek, Above5DayMA,
+    ReturnToday, LaggedReturn, Range, Volume, FiveDayMA
+  )
+
+glimpse(model_data)
+summary(model_data$UpNextDay)
+```
+
+## Part 2: Exploratory Data Analysis
+
+```{r eda, fig.width=10, fig.height=8}
+# EDA
+
+p1 <- ggplot(model_data, aes(x = UpNextDay)) +
+  geom_bar() +
+  labs(
+    title = "Class Balance: Up vs Down Next Day",
+    x = "UpNextDay",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+p2 <- ggplot(model_data, aes(x = Stock, fill = UpNextDay)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Proportion Up vs Down by Stock",
+    y = "Proportion"
+  ) +
+  theme_minimal()
+
+p3 <- ggplot(model_data, aes(x = UpNextDay, y = ReturnToday)) +
+  geom_boxplot() +
+  labs(
+    title = "ReturnToday Distribution by UpNextDay",
+    x = "UpNextDay",
+    y = "ReturnToday"
+  ) +
+  theme_minimal()
+
+p4 <- ggplot(model_data, aes(x = UpNextDay, y = Volume)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  labs(
+    title = "Volume by UpNextDay",
+    x = "UpNextDay",
+    y = "Volume (log10)"
+  ) +
+  theme_minimal()
+
+p5 <- model_data %>%
+  group_by(DayOfWeek) %>%
+  summarize(
+    prop_up = mean(UpNextDay == "Up"),
+    n       = n()
+  ) %>%
+  ggplot(aes(x = DayOfWeek, y = prop_up)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Proportion of UpNextDay by Day of Week",
+    x = "Day of Week",
+    y = "Proportion Up"
+  ) +
+  theme_minimal()
+
+eda_dashboard <- (p1 | p2) / (p3 | p4)
+
+eda_dashboard
+p5
+```
+
+## Part 3: Predictive Modeling
+
+```{r modeling, message=FALSE, warning=FALSE}
+set.seed(123)
+
+# Modeling w caret
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 5
+)
+
+full_formula <- UpNextDay ~ Stock + DayOfWeek + Above5DayMA +
+  ReturnToday + LaggedReturn + Range + Volume + FiveDayMA
+
+subset_formula <- UpNextDay ~ Stock + ReturnToday + LaggedReturn + Above5DayMA
+
+set.seed(123)
+model_logit_full <- train(
+  full_formula,
+  data = model_data,
+  method = "glm",
+  family = binomial,
+  trControl = ctrl
+)
+
+set.seed(123)
+model_logit_subset <- train(
+  subset_formula,
+  data = model_data,
+  method = "glm",
+  family = binomial,
+  trControl = ctrl
+)
+
+set.seed(123)
+model_tree <- train(
+  full_formula,
+  data = model_data,
+  method = "rpart",
+  trControl = ctrl,
+  tuneLength = 5
+)
+
+set.seed(123)
+model_rf <- train(
+  full_formula,
+  data = model_data,
+  method = "rf",
+  trControl = ctrl,
+  tuneLength = 5
+)
+
+set.seed(123)
+model_knn <- train(
+  full_formula,
+  data = model_data,
+  method = "knn",
+  trControl = ctrl,
+  tuneLength = 5
+)
+
+# Model comparison
+
+get_best_metric <- function(model, metric = "Accuracy") {
+  model$results %>%
+    arrange(desc(.data[[metric]])) %>%
+    slice(1) %>%
+    pull(.data[[metric]])
+}
+
+model_results <- tibble(
+  Model    = c(
+    "Logistic (Whole)",
+    "Logistic (subset)",
+    "Tree",
+    "Random Forest",
+    "k-NN"
+  ),
+  Accuracy = c(
+    get_best_metric(model_logit_full),
+    get_best_metric(model_logit_subset),
+    get_best_metric(model_tree),
+    get_best_metric(model_rf),
+    get_best_metric(model_knn)
+  )
+)
+
+print(model_results)
+
+model_comp_plot <- ggplot(model_results, aes(x = reorder(Model, Accuracy), y = Accuracy)) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Model Comparison 5 Fold",
+    x = "Model",
+    y = "Accuracy"
+  ) +
+  theme_minimal()
+
+final_dashboard <- (p1 | p2) / (p3 | model_comp_plot)
+
+final_dashboard
+```
+
+## Analysis Goals and Findings
+#The goal of this analysis was to predict whether AAPL and AMZN would increase in price the following day using historical trading data and engineered financial indicators. My  analysis revealed meaningful but limited relation between next day movement and variables like daily return, volatility, moving averages, and trading volume. Five predictive models were trained using 5 fold cross validation. The random forest model had the highest accuracy, slightly outperforming logistic regression, KNN, and a single decision tree. Results show that short term stock direction is somewhat predictable. The performance levels are consistent with expectations for financial time series, when noise is high and daily price changes are influenced by external factors that aren't shown in historical price data. Even then, the models have features like momentum indicators and volatility measures to give information about future price direction. Predicting next day stock movement is obviously challenging, but this analysis shows that purposeful building and proper modeling techniques can show modest but real predictive signals.
+---
+
+## Part 4: Portfolio Simulation of Model Guided Daily Contributions
+
+```{r portfolio-sim, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+library(scales) 
+
+cutoff_date <- max(stocks_all$Date) - 365*5
+
+last5 <- stocks_all %>% filter(Date >= cutoff_date)
+
+pf_data <- last5 %>%
+  arrange(Stock, Date) %>%
+  group_by(Stock) %>%
+  mutate(
+    ReturnToday   = (Close - Open) / Open,
+    Range         = High - Low,
+    FiveDayMA     = zoo::rollmean(Close, k = 5, fill = NA, align = "right"),
+    Above5DayMA   = ifelse(Close > FiveDayMA, "Yes", "No"),
+    LaggedReturn  = lag(ReturnToday),
+    NextDayReturn = lead(Close) / Close - 1,            
+    UpNextDay     = factor(ifelse(NextDayReturn > 0, "Up", "Down")),
+    DayOfWeek     = factor(weekdays(Date))
+  ) %>%
+  ungroup() %>%
+  filter(
+    !is.na(NextDayReturn),
+    !is.na(ReturnToday),
+    !is.na(LaggedReturn),
+    !is.na(FiveDayMA)
+  ) %>%
+  mutate(
+    Stock       = factor(Stock),
+    Above5DayMA = factor(Above5DayMA, levels = c("No","Yes"))
+  )
+
+pf_formula <- UpNextDay ~ Stock + DayOfWeek + Above5DayMA +
+  ReturnToday + LaggedReturn + Range + Volume + FiveDayMA
+
+set.seed(123)
+rf_last5 <- caret::train(
+  pf_formula,
+  data = pf_data,
+  method = "rf",
+  trControl = trainControl(method = "cv", number = 5),
+  tuneLength = 5
+)
+
+pf_data$PredictedUp <- predict(rf_last5, newdata = pf_data)
+
+pf_data$Correct <- pf_data$PredictedUp == pf_data$UpNextDay
+model_accuracy <- mean(pf_data$Correct, na.rm = TRUE)
+model_accuracy
+
+market_returns <- pf_data %>%
+  group_by(Date) %>%
+  summarize(
+    market_return = mean(NextDayReturn, na.rm = TRUE),  
+    any_up_signal = any(PredictedUp == "Up")         
+  ) %>%
+  ungroup() %>%
+  arrange(Date)
+
+years <- length(unique(lubridate::year(market_returns$Date)))
+days  <- nrow(market_returns)
+avg_days_per_year <- days / years
+daily_contribution <- 30000 / avg_days_per_year   
+
+market_returns <- market_returns %>%
+  mutate(
+    contribution        = ifelse(any_up_signal, daily_contribution, 0),
+    total_contributions = cumsum(contribution),
+    index               = row_number()
+  )
+
+
+portfolio_value <- numeric(nrow(market_returns))
+
+for (i in seq_len(nrow(market_returns))) {
+  if (i == 1) {
+    portfolio_value[i] <- market_returns$contribution[i] *
+      (1 + market_returns$market_return[i])
+  } else {
+    portfolio_value[i] <- portfolio_value[i - 1] * (1 + market_returns$market_return[i]) +
+      market_returns$contribution[i]
+  }
+}
+
+portfolio <- market_returns %>%
+  mutate(
+    portfolio_value = portfolio_value,
+    investment_gain = portfolio_value - total_contributions
+  )
+
+
+label_idx <- unique(round(c(1,
+                            0.25 * nrow(portfolio),
+                            0.50 * nrow(portfolio),
+                            0.75 * nrow(portfolio),
+                            nrow(portfolio))))
+
+label_points <- portfolio[label_idx, ]
+
+
+max_y <- max(portfolio$portfolio_value, portfolio$total_contributions, na.rm = TRUE)
+
+portfolio_plot <- ggplot(portfolio, aes(x = Date)) +
+  geom_line(aes(y = total_contributions, color = "Total Contributions"), linewidth = 1) +
+  geom_line(aes(y = portfolio_value, color = "Portfolio Value"), linewidth = 1.1) +
+  geom_line(aes(y = investment_gain, color = "Investment Gain"), linewidth = 1) +
+
+  geom_point(data = label_points, aes(y = portfolio_value), size = 2) +
+  geom_text(
+    data = label_points,
+    aes(
+      y = portfolio_value,
+      label = dollar(round(portfolio_value, 0))
+    ),
+    vjust = -1,
+    size = 3
+  ) +
+
+  labs(
+    title = "Hypothetical Portfolio Performance Using Model Guided Strategy Nov 2020 - Nov 2025",
+    subtitle = "Sustained investment, ~$119/trade-day ~$30,000/year contributing only on days the model predicts a positive yield",
+    y = "Portfolio Value",
+    color = "Legend"
+  ) +
+  scale_y_continuous(
+    labels = dollar_format(),
+    limits = c(0, max_y * 1.05)
+  ) +
+  scale_color_manual(values = c(
+    "Total Contributions" = "#1f77b4",
+    "Portfolio Value"     = "#2ca02c",
+    "Investment Gain"     = "#d62728"
+  )) +
+  theme_minimal(base_size = 14)
+
+portfolio_plot
+```
+
+## Additional Informative Graph
+#I included this graph to simply show what the original model's results could do if applied correctly. This is a graph depicting the yield of a hypothetical personal portfolio, if they were to contribute their investments solely on the days the model anticipated the stocks to rise over five years. 
+---
+
